@@ -1787,6 +1787,48 @@ mod tests {
 
     /// `f` is omitted entirely when false, which keeps the msgpack signing hash unchanged
     /// for callers that never opt into fast cancels.
+    /// The pre-`fast` wire shape, as it existed before the field was added.
+    #[derive(serde::Serialize)]
+    struct OldBatchCancel {
+        cancels: Vec<crate::hypercore::types::Cancel>,
+    }
+
+    #[derive(serde::Serialize)]
+    #[serde(tag = "type", rename_all = "camelCase")]
+    enum OldAction {
+        Cancel(OldBatchCancel),
+    }
+
+    /// Adding `fast` must not change the msgpack bytes for existing callers, since the
+    /// signature is taken over that encoding.
+    #[test]
+    fn fast_false_is_byte_identical_to_the_old_shape() {
+        let cancels = vec![
+            crate::hypercore::types::Cancel { asset: 1, oid: 42 },
+            crate::hypercore::types::Cancel { asset: 7, oid: 99 },
+        ];
+
+        let old = rmp_serde::to_vec_named(&OldAction::Cancel(OldBatchCancel {
+            cancels: cancels.clone(),
+        }))
+        .unwrap();
+
+        let new = rmp_serde::to_vec_named(&Action::Cancel(BatchCancel {
+            cancels: cancels.clone(),
+            fast: false,
+        }))
+        .unwrap();
+
+        assert_eq!(old, new, "fast:false changed the signing bytes");
+
+        let fast = rmp_serde::to_vec_named(&Action::Cancel(BatchCancel {
+            cancels,
+            fast: true,
+        }))
+        .unwrap();
+        assert_ne!(old, fast, "fast:true should change the signing bytes");
+    }
+
     #[test]
     fn cancel_fast_flag_is_omitted_when_false() {
         let cancels = vec![crate::hypercore::types::Cancel { asset: 1, oid: 42 }];
