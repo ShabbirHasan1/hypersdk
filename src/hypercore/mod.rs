@@ -842,6 +842,8 @@ pub struct PerpMarket {
     pub isolated_margin: bool,
     /// Margin mode for this market
     pub margin_mode: Option<MarginMode>,
+    /// The deployer fee scale for this market.
+    pub deployer_fee_scale: Option<Decimal>,
     /// Whether growth mode is enabled for this market
     pub growth_mode: bool,
     /// Whether the quote token is aligned for this market
@@ -1596,7 +1598,6 @@ pub async fn perp_dexes(
             dex.map(|dex| Dex {
                 name: dex.name,
                 index,
-                deployer_fee_scale: dex.deployer_fee_scale,
             })
         })
         .collect();
@@ -1617,8 +1618,6 @@ pub async fn perp_dexs(
 #[serde(rename_all = "camelCase")]
 struct PerpDex {
     name: String,
-    #[serde(default, with = "rust_decimal::serde::str_option")]
-    deployer_fee_scale: Option<Decimal>,
 }
 
 /// Fetches all available perpetual futures markets from HyperCore.
@@ -1665,6 +1664,7 @@ pub async fn perp_markets(
                 collateral: collateral.clone(),
                 isolated_margin: perp.only_isolated,
                 margin_mode: perp.margin_mode,
+                deployer_fee_scale: perp.deployer_fee_scale,
                 growth_mode: perp.growth_mode,
                 aligned_quote_token: perp.aligned_quote_token,
                 table: PriceTick::for_perp(perp.sz_decimals),
@@ -1814,6 +1814,8 @@ struct PerpUniverseItem {
     only_isolated: bool,
     margin_mode: Option<MarginMode>,
     sz_decimals: i64,
+    #[serde(default, with = "rust_decimal::serde::str_option")]
+    deployer_fee_scale: Option<Decimal>,
     #[serde(default, deserialize_with = "deserialize_growth_mode")]
     growth_mode: bool,
     #[serde(default, alias = "isAlignedQuoteToken", alias = "isQuoteTokenAligned")]

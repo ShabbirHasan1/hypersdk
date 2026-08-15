@@ -207,7 +207,6 @@ pub const ARBITRUM_TESTNET_EIP712_DOMAIN: Eip712Domain = eip712_domain! {
 pub struct Dex {
     pub(super) name: String,
     pub(super) index: usize,
-    pub(super) deployer_fee_scale: Option<Decimal>,
 }
 
 impl Dex {
@@ -225,7 +224,6 @@ impl Dex {
         Dex {
             name,
             index,
-            deployer_fee_scale: None,
         }
     }
 
@@ -239,12 +237,6 @@ impl Dex {
     #[must_use]
     pub fn index(&self) -> usize {
         self.index
-    }
-
-    /// Returns the deployer fee scale for this DEX.
-    #[must_use]
-    pub fn deployer_fee_scale(&self) -> Option<Decimal> {
-        self.deployer_fee_scale
     }
 }
 
