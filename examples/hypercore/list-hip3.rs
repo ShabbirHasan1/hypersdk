@@ -12,16 +12,16 @@ async fn main() -> anyhow::Result<()> {
     let dexes = client.perp_dexes().await?;
     for dex in dexes {
         println!("\n\nmarkets for {dex}");
-        println!("deployer fee scale: {:?}", dex.deployer_fee_scale());
 
         let markets = client.perps_from(dex).await?;
         for market in markets {
             println!(
-                "{}\t{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{:?}\t{}\t{}",
                 market.name,
                 market.index,
                 market.name,
                 market.collateral,
+                market.deployer_fee_scale,
                 market.growth_mode,
                 market.aligned_quote_token
             );
