@@ -45,7 +45,7 @@ use std::{
 };
 
 use alloy::{
-    primitives::Address,
+    primitives::{Address, Bytes},
     signers::{Signer, SignerSync},
 };
 use anyhow::{Context, Result, anyhow};
@@ -59,11 +59,14 @@ use crate::hypercore::{
     ActionError, ApiAgent, Builder, CandleInterval, Chain, Cloid, Dex, GossipPriorityAuctionStatus,
     Market, MultiSigConfig, OidOrCloid, OutcomeMeta, PerpMarket, Signature, SpotMarket, SpotToken,
     api::{
-        Action, ActionRequest, ApproveAgent, ApproveBuilderFee, ConvertToMultiSigUser,
-        GossipPriorityBid, Hip3LiquidatorTransferAction, OkResponse, Response, SignersConfig,
-        TokenDelegateAction, TwapOrderParams, UpdateIsolatedMargin, UpdateLeverage,
-        UsdClassTransferAction, UserOutcomeAction, VaultTransfer, Withdraw3Action,
+        Action, ActionRequest, AddressEncoding, ApproveAgent, ApproveBuilderFee, Aqav2Role,
+        AuthorizeAqav2Role, ConvertToMultiSigUser, GossipPriorityBid, Hip3LiquidatorTransferAction,
+        OkResponse, Response, SendToEvmWithDataAction, SignersConfig, TokenDelegateAction,
+        TopUpIsolatedOnlyMargin, TwapOrderParams, UpdateIsolatedMargin, UpdateLeverage,
+        UsdClassTransferAction, UserOutcomeAction, ValidatorL1Stream, VaultTransfer,
+        Withdraw3Action,
     },
+    deploy::{ActivateOutcomeDeployer, PerpDeployAction, SpotDeployAction},
     mainnet_url, testnet_url,
     types::{
         AbstractionMode, ActiveAssetData, AgentSendAsset, BasicOrder, BatchCancel,
@@ -387,7 +390,11 @@ impl Client {
     ///
     /// The `label` parameter is included in error messages for debugging — it should
     /// identify the calling endpoint (e.g., `"open_orders"`, `"user_balances"`).
-    async fn send_info_request<R>(&self, label: &str, req: &impl serde::Serialize) -> Result<R>
+    pub(crate) async fn send_info_request<R>(
+        &self,
+        label: &str,
+        req: &impl serde::Serialize,
+    ) -> Result<R>
     where
         R: for<'de> Deserialize<'de>,
     {
@@ -1899,6 +1906,16 @@ impl Client {
             .map_err(|e| anyhow!("failed to parse user abstraction mode: {e}"))
     }
 
+    /// Query whether HIP-3 DEX abstraction is enabled for a user.
+    ///
+    /// Returns `None` when the user has never set it, which the API reports as `null`.
+    ///
+    /// <https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint#query-a-users-hip-3-dex-abstraction-state>
+    pub async fn user_dex_abstraction(&self, user: Address) -> Result<Option<bool>> {
+        let req = InfoRequest::UserDexAbstraction { user };
+        self.send_info_request("user_dex_abstraction", &req).await
+    }
+
     /// Set abstraction mode via agent-signed action (L1/RMP signing).
     ///
     /// Changes the account's abstraction mode to one of:
@@ -2341,11 +2358,15 @@ impl Client {
             .await
     }
 
-    /// Returns aligned quote token info.
-    pub async fn aligned_quote_token_info(&self, token: u32) -> Result<serde_json::Value> {
-        let req = InfoRequest::AlignedQuoteTokenInfo { token };
-        self.send_info_request("aligned_quote_token_info", &req)
-            .await
+    /// Returns all HIP-4 outcome templates.
+    ///
+    /// Templates are voted on by validators and fix the display text, side names, and typed
+    /// keywords that outcome deployments are built from.
+    ///
+    /// <https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/hip-4-deployer-actions#read-api>
+    pub async fn outcome_templates(&self) -> Result<serde_json::Value> {
+        let req = InfoRequest::OutcomeTemplates;
+        self.send_info_request("outcome_templates", &req).await
     }
 
     /// Returns TWAP slice fills for a user via info endpoint.
@@ -2500,15 +2521,21 @@ impl Client {
     }
 
     /// Reserve rate-limit request capacity.
+    ///
+    /// `destination` credits the reserved capacity to another account; `None` credits the signer.
     pub async fn reserve_request_weight<S: SignerSync>(
         &self,
         signer: &S,
         weight: u32,
+        destination: Option<Address>,
         nonce: u64,
         vault_address: Option<Address>,
         expires_after: Option<DateTime<Utc>>,
     ) -> Result<()> {
-        let action = Action::ReserveRequestWeight { weight };
+        let action = Action::ReserveRequestWeight {
+            weight,
+            destination,
+        };
         let req = action.sign_sync(signer, nonce, vault_address, expires_after, self.chain)?;
         self.send(req).await?.into_default()
     }
@@ -2529,6 +2556,168 @@ impl Client {
             ntl,
             is_deposit,
         });
+        let req = action.sign_sync(signer, nonce, vault_address, expires_after, self.chain)?;
+        self.send(req).await?.into_default()
+    }
+
+    /// Send a HIP-1/HIP-2 spot deploy action, or a HIP-4 outcome deploy action.
+    ///
+    /// Deploying a token is the five-step sequence described on [`SpotDeployAction`]. Lists of
+    /// tuples must already be sorted, since the signature covers their encoding.
+    ///
+    /// <https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/deploying-hip-1-and-hip-2-assets>
+    pub async fn spot_deploy<S: SignerSync>(
+        &self,
+        signer: &S,
+        action: SpotDeployAction,
+        nonce: u64,
+        vault_address: Option<Address>,
+        expires_after: Option<DateTime<Utc>>,
+    ) -> Result<()> {
+        let action = Action::SpotDeploy(action);
+        let req = action.sign_sync(signer, nonce, vault_address, expires_after, self.chain)?;
+        self.send(req).await?.into_default()
+    }
+
+    /// Send a HIP-3 perp DEX deployer action.
+    ///
+    /// Lists of tuples must already be sorted, since the signature covers their encoding.
+    ///
+    /// <https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/hip-3-deployer-actions>
+    pub async fn perp_deploy<S: SignerSync>(
+        &self,
+        signer: &S,
+        action: PerpDeployAction,
+        nonce: u64,
+        vault_address: Option<Address>,
+        expires_after: Option<DateTime<Utc>>,
+    ) -> Result<()> {
+        let action = Action::PerpDeploy(action);
+        let req = action.sign_sync(signer, nonce, vault_address, expires_after, self.chain)?;
+        self.send(req).await?.into_default()
+    }
+
+    /// Activate or permanently retire a HIP-4 outcome deployer.
+    ///
+    /// <https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/hip-4-deployer-actions#activation>
+    pub async fn activate_outcome_deployer<S: SignerSync>(
+        &self,
+        signer: &S,
+        action: ActivateOutcomeDeployer,
+        nonce: u64,
+        vault_address: Option<Address>,
+        expires_after: Option<DateTime<Utc>>,
+    ) -> Result<()> {
+        let action = Action::ActivateOutcomeDeployer(action);
+        let req = action.sign_sync(signer, nonce, vault_address, expires_after, self.chain)?;
+        self.send(req).await?.into_default()
+    }
+
+    /// Transfer a token from Core to the EVM with an extra data payload.
+    ///
+    /// The recipient contract must implement `ICoreReceiveWithData`. `nonce` is written into the
+    /// action as well as the request envelope, so both must match.
+    ///
+    /// <https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/exchange-endpoint#send-to-evm-with-data>
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_to_evm_with_data<S: SignerSync>(
+        &self,
+        signer: &S,
+        token: String,
+        amount: Decimal,
+        source_dex: String,
+        destination_recipient: String,
+        address_encoding: AddressEncoding,
+        destination_chain_id: u32,
+        gas_limit: u64,
+        data: Bytes,
+        nonce: u64,
+        expires_after: Option<DateTime<Utc>>,
+    ) -> Result<()> {
+        let action = Action::SendToEvmWithData(SendToEvmWithDataAction {
+            signature_chain_id: self.chain.arbitrum_id().to_string(),
+            hyperliquid_chain: self.chain,
+            token,
+            amount,
+            source_dex,
+            destination_recipient,
+            address_encoding,
+            destination_chain_id,
+            gas_limit,
+            data,
+            nonce,
+        });
+        let req = action.sign_sync(signer, nonce, None, expires_after, self.chain)?;
+        self.send(req).await?.into_default()
+    }
+
+    /// Add isolated margin to a position until it reaches `leverage`.
+    ///
+    /// The leverage-targeting counterpart to [`update_isolated_margin`](Self::update_isolated_margin),
+    /// which moves a fixed USDC amount instead.
+    pub async fn top_up_isolated_only_margin<S: SignerSync>(
+        &self,
+        signer: &S,
+        asset: u32,
+        leverage: Decimal,
+        nonce: u64,
+        vault_address: Option<Address>,
+        expires_after: Option<DateTime<Utc>>,
+    ) -> Result<()> {
+        let action = Action::TopUpIsolatedOnlyMargin(TopUpIsolatedOnlyMargin { asset, leverage });
+        let req = action.sign_sync(signer, nonce, vault_address, expires_after, self.chain)?;
+        self.send(req).await?.into_default()
+    }
+
+    /// Claim accrued referral and builder rewards.
+    ///
+    /// <https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/exchange-endpoint#claim-rewards>
+    pub async fn claim_rewards<S: SignerSync>(
+        &self,
+        signer: &S,
+        nonce: u64,
+        vault_address: Option<Address>,
+        expires_after: Option<DateTime<Utc>>,
+    ) -> Result<()> {
+        let req = Action::ClaimRewards.sign_sync(
+            signer,
+            nonce,
+            vault_address,
+            expires_after,
+            self.chain,
+        )?;
+        self.send(req).await?.into_default()
+    }
+
+    /// Authorize an AQAv2 role for an aligned quote asset.
+    ///
+    /// <https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/exchange-endpoint#authorize-aqav2-role>
+    pub async fn authorize_aqav2_role<S: SignerSync>(
+        &self,
+        signer: &S,
+        token: u32,
+        role: Aqav2Role,
+        nonce: u64,
+        vault_address: Option<Address>,
+        expires_after: Option<DateTime<Utc>>,
+    ) -> Result<()> {
+        let action = Action::AuthorizeAqav2Role(AuthorizeAqav2Role { token, role });
+        let req = action.sign_sync(signer, nonce, vault_address, expires_after, self.chain)?;
+        self.send(req).await?.into_default()
+    }
+
+    /// Validator vote on the risk-free rate for an aligned quote asset.
+    ///
+    /// Only meaningful when the signer is a validator.
+    pub async fn validator_l1_stream<S: SignerSync>(
+        &self,
+        signer: &S,
+        risk_free_rate: Decimal,
+        nonce: u64,
+        vault_address: Option<Address>,
+        expires_after: Option<DateTime<Utc>>,
+    ) -> Result<()> {
+        let action = Action::ValidatorL1Stream(ValidatorL1Stream { risk_free_rate });
         let req = action.sign_sync(signer, nonce, vault_address, expires_after, self.chain)?;
         self.send(req).await?.into_default()
     }

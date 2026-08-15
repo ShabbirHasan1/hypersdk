@@ -90,6 +90,7 @@ use serde_with::{DisplayFromStr, serde_as};
 use crate::hypercore::{Chain, Cloid, OidOrCloid, SpotToken};
 
 pub mod api;
+pub mod deploy;
 pub(super) mod solidity;
 
 // Re-export important raw types for convenience
@@ -221,10 +222,7 @@ impl Dex {
     ///
     /// A new `Dex` instance.
     pub fn new(name: String, index: usize) -> Dex {
-        Dex {
-            name,
-            index,
-        }
+        Dex { name, index }
     }
 
     /// Returns the DEX name.
@@ -274,10 +272,61 @@ pub enum Side {
 #[serde(tag = "method")]
 #[serde(rename_all = "camelCase")]
 pub enum Outgoing {
-    Subscribe { subscription: Subscription },
-    Unsubscribe { subscription: Subscription },
+    Subscribe {
+        subscription: Subscription,
+    },
+    Unsubscribe {
+        subscription: Subscription,
+    },
+    /// An info request or a signed action sent over the socket instead of HTTP.
+    ///
+    /// The server replies with [`Incoming::Post`] carrying the same `id`.
+    Post {
+        id: u64,
+        request: PostRequest,
+    },
     Ping,
     Pong,
+}
+
+/// Payload of an [`Outgoing::Post`].
+///
+/// Anything postable over HTTP is postable here, except `explorer` requests.
+///
+/// <https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket/post-requests>
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload")]
+#[serde(rename_all = "camelCase")]
+pub enum PostRequest {
+    /// An info request body, the same JSON that `/info` accepts.
+    Info(serde_json::Value),
+    /// A signed action, the same body that `/exchange` accepts.
+    Action(Box<ActionRequest>),
+}
+
+/// Server reply to an [`Outgoing::Post`], delivered as [`Incoming::Post`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PostResponse {
+    /// Echoes the `id` of the originating [`Outgoing::Post`].
+    pub id: u64,
+    /// The result, or an error mirroring the HTTP status that would have been returned.
+    pub response: PostResponsePayload,
+}
+
+/// Result of a posted request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload")]
+#[serde(rename_all = "camelCase")]
+pub enum PostResponsePayload {
+    /// Response to a [`PostRequest::Info`].
+    ///
+    /// Note this is wrapped one level deeper than the HTTP response: the value is
+    /// `{"type": <the info request type>, "data": <what /info would have returned>}`.
+    Info(serde_json::Value),
+    /// Response to a [`PostRequest::Action`].
+    Action(Response),
+    /// The request failed. Mirrors the HTTP status code and description.
+    Error(String),
 }
 
 /// WebSocket subscription request.
@@ -511,6 +560,8 @@ pub enum Subscription {
 pub enum Incoming {
     /// Confirmation of subscription/unsubscription
     SubscriptionResponse(Outgoing),
+    /// Reply to an [`Outgoing::Post`], correlated by its `id`.
+    Post(PostResponse),
     /// Best bid and offer update
     Bbo(Bbo),
     /// Order book snapshot or delta
@@ -2260,7 +2311,7 @@ impl AgentSendAsset {
 /// }
 /// # }
 /// ```
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum OrderResponseStatus {
     /// Order accepted (generic)
@@ -2571,6 +2622,11 @@ pub struct Modify {
 #[serde(rename_all = "camelCase")]
 pub struct BatchCancel {
     pub cancels: Vec<Cancel>,
+    /// Fast cancel. Rejected if any cancel refers to a trigger order.
+    ///
+    /// Omitted from the request (and from the signing hash) when `false`.
+    #[serde(rename = "f", default, skip_serializing_if = "std::ops::Not::not")]
+    pub fast: bool,
 }
 
 /// Batch cancel by cloid request.
@@ -2580,6 +2636,11 @@ pub struct BatchCancel {
 #[serde(rename_all = "camelCase")]
 pub struct BatchCancelCloid {
     pub cancels: Vec<CancelByCloid>,
+    /// Fast cancel. Rejected if any cancel refers to a trigger order.
+    ///
+    /// Omitted from the request (and from the signing hash) when `false`.
+    #[serde(rename = "f", default, skip_serializing_if = "std::ops::Not::not")]
+    pub fast: bool,
 }
 
 /// Cancel request for a single order.
@@ -3931,6 +3992,12 @@ pub(super) enum InfoRequest {
     UserAbstraction {
         user: Address,
     },
+    /// Query HIP-3 DEX abstraction state for a user.
+    UserDexAbstraction {
+        user: Address,
+    },
+    /// All HIP-4 outcome templates.
+    OutcomeTemplates,
     /// Check builder fee approval for a user.
     MaxBuilderFee {
         user: Address,
@@ -4048,10 +4115,6 @@ pub(super) enum InfoRequest {
     },
     /// All borrow/lend reserve states.
     AllBorrowLendReserveStates,
-    /// Aligned quote token info.
-    AlignedQuoteTokenInfo {
-        token: u32,
-    },
     /// TWAP slice fills via info endpoint.
     UserTwapSliceFills {
         user: Address,
@@ -5042,6 +5105,182 @@ mod tests {
         }
     }
 
+    /// Checks that mainnet still answers every info request this SDK can build.
+    ///
+    /// Serialization tests only prove the SDK sends what it intends to; they cannot notice
+    /// the exchange dropping an endpoint. This walks every [`InfoRequest`] variant against
+    /// the live API and fails on an HTTP error. A 422 "Failed to deserialize" is how a
+    /// removed request type shows up, which is exactly how the dead `alignedQuoteTokenInfo`
+    /// was found.
+    ///
+    /// Ignored by default because it hits the network. Run it when the API docs change:
+    ///
+    /// ```bash
+    /// cargo test --lib info_requests_are_still_answered -- --ignored --nocapture
+    /// ```
+    ///
+    /// The deployer-action counterpart is
+    /// `hypercore::types::deploy::tests::deployer_action_shapes_are_still_accepted`.
+    #[tokio::test]
+    #[ignore = "hits mainnet; run manually when auditing the SDK against the API docs"]
+    async fn info_requests_are_still_answered() {
+        use alloy::primitives::address;
+
+        // An arbitrary address with history, so responses are non-trivial.
+        const USER: Address = address!("0xa166e3fa63c25663024b03f2e0da011a00307e40");
+        const HLP: Address = address!("0xdfc24b077bc1425ad1dea75bcb6f8158e10df303");
+
+        let client = crate::hypercore::mainnet();
+        let requests = vec![
+            InfoRequest::Meta { dex: None },
+            InfoRequest::SpotMeta,
+            InfoRequest::PerpDexs,
+            InfoRequest::FrontendOpenOrders {
+                user: USER,
+                dex: None,
+            },
+            InfoRequest::HistoricalOrders { user: USER },
+            InfoRequest::UserFills {
+                user: USER,
+                aggregate_by_time: None,
+            },
+            InfoRequest::UserFillsByTime {
+                user: USER,
+                start_time: 1_750_000_000_000,
+                end_time: None,
+                aggregate_by_time: None,
+            },
+            InfoRequest::OrderStatus {
+                user: USER,
+                oid: either::Either::Left(1),
+            },
+            InfoRequest::SpotClearinghouseState { user: USER },
+            InfoRequest::ClearinghouseState {
+                user: USER,
+                dex: None,
+            },
+            InfoRequest::AllMids { dex: None },
+            InfoRequest::CandleSnapshot {
+                req: CandleSnapshotRequest {
+                    coin: "BTC".to_string(),
+                    interval: CandleInterval::OneHour,
+                    start_time: 1_750_000_000_000,
+                    end_time: 1_750_003_600_000,
+                },
+            },
+            InfoRequest::UserToMultiSigSigners { user: USER },
+            InfoRequest::ExtraAgents { user: USER },
+            InfoRequest::FundingHistory {
+                coin: "BTC".to_string(),
+                start_time: 1_750_000_000_000,
+                end_time: None,
+            },
+            InfoRequest::VaultDetails {
+                vault_address: HLP,
+                user: None,
+            },
+            InfoRequest::UserVaultEquities { user: USER },
+            InfoRequest::UserRole { user: USER },
+            InfoRequest::SubAccounts { user: USER },
+            InfoRequest::UserFees { user: USER },
+            InfoRequest::OutcomeMeta,
+            InfoRequest::OutcomeTemplates,
+            InfoRequest::GossipPriorityAuctionStatus,
+            InfoRequest::UserAbstraction { user: USER },
+            InfoRequest::UserDexAbstraction { user: USER },
+            InfoRequest::MaxBuilderFee {
+                user: USER,
+                builder: USER,
+            },
+            InfoRequest::MetaAndAssetCtxs { dex: None },
+            InfoRequest::SpotMetaAndAssetCtxs,
+            InfoRequest::UserRateLimit { user: USER },
+            InfoRequest::UserFunding {
+                user: USER,
+                start_time: 1_750_000_000_000,
+                end_time: None,
+            },
+            InfoRequest::UserNonFundingLedgerUpdates {
+                user: USER,
+                start_time: 1_750_000_000_000,
+                end_time: None,
+            },
+            InfoRequest::PredictedFundings,
+            InfoRequest::PerpsAtOpenInterestCap { dex: None },
+            InfoRequest::PerpDeployAuctionStatus,
+            InfoRequest::ActiveAssetData {
+                user: USER,
+                coin: "BTC".to_string(),
+            },
+            // A DEX that actually exists; a made-up name returns HTTP 500.
+            InfoRequest::PerpDexLimits {
+                dex: "flx".to_string(),
+            },
+            InfoRequest::PerpDexStatus {
+                dex: "flx".to_string(),
+            },
+            InfoRequest::AllPerpMetas,
+            InfoRequest::PerpAnnotation {
+                coin: "BTC".to_string(),
+            },
+            InfoRequest::PerpCategories,
+            InfoRequest::PerpConciseAnnotations,
+            InfoRequest::SpotDeployState { user: USER },
+            InfoRequest::SpotPairDeployAuctionStatus,
+            InfoRequest::TokenDetails {
+                token_id: "0x6d1e7cde53ba9467b783cb7c530ce054".to_string(),
+            },
+            InfoRequest::SettledOutcome { outcome: 0 },
+            InfoRequest::Portfolio { user: USER },
+            InfoRequest::Referral { user: USER },
+            InfoRequest::ApprovedBuilders { user: USER },
+            InfoRequest::Delegations { user: USER },
+            InfoRequest::DelegatorSummary { user: USER },
+            InfoRequest::DelegatorHistory { user: USER },
+            InfoRequest::DelegatorRewards { user: USER },
+            InfoRequest::BorrowLendUserState { user: USER },
+            InfoRequest::BorrowLendReserveState { token: 0 },
+            InfoRequest::AllBorrowLendReserveStates,
+            InfoRequest::UserTwapSliceFills { user: USER },
+            InfoRequest::L2Book {
+                coin: "BTC".to_string(),
+                n_sig_figs: None,
+                mantissa: None,
+            },
+            InfoRequest::OpenOrders { user: USER },
+        ];
+
+        let mut failures = Vec::new();
+        for req in requests {
+            let label = serde_json::to_value(&req).unwrap()["type"]
+                .as_str()
+                .unwrap()
+                .to_string();
+
+            // Parsed loosely: this asserts the endpoint answers, not that the SDK's
+            // response type still matches.
+            match client
+                .send_info_request::<serde_json::Value>(&label, &req)
+                .await
+            {
+                Ok(_) => println!("{label:32} ok"),
+                Err(err) => {
+                    let err = err.to_string().chars().take(120).collect::<String>();
+                    println!("{label:32} FAILED {err}");
+                    failures.push(format!("{label}: {err}"));
+                }
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        }
+
+        assert!(
+            failures.is_empty(),
+            "info requests the exchange no longer answers:\n{}",
+            failures.join("\n")
+        );
+    }
+
     mod info_request_serialization {
         use alloy::primitives::address;
         use either::Either;
@@ -5605,14 +5844,6 @@ mod tests {
             assert_json(
                 InfoRequest::AllBorrowLendReserveStates,
                 serde_json::json!({"type": "allBorrowLendReserveStates"}),
-            );
-        }
-
-        #[test]
-        fn aligned_quote_token_info() {
-            assert_json(
-                InfoRequest::AlignedQuoteTokenInfo { token: 5 },
-                serde_json::json!({"type": "alignedQuoteTokenInfo", "token": 5}),
             );
         }
 

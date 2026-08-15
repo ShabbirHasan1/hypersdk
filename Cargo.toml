@@ -108,6 +108,10 @@ name = "websocket-user-events"
 path = "examples/hypercore/websocket-user-events.rs"
 
 [[example]]
+name = "websocket-post"
+path = "examples/hypercore/websocket_post.rs"
+
+[[example]]
 name = "vault_details"
 path = "examples/hypercore/vault_details.rs"
 
